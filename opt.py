@@ -54,23 +54,28 @@ def get_opts():
     parser.add_argument('--lr_scheduler', type=str, default='steplr',
                         help='scheduler type',
                         choices=['steplr', 'cosine', 'poly'])
-    #### params for warmup, only applied when optimizer == 'sgd' or 'adam'
+
+    #####################################################################
+    # params for warmup, only applied when optimizer == 'sgd' or 'adam' #
+    #####################################################################
     parser.add_argument('--warmup_multiplier', type=float, default=1.0,
                         help='lr is multiplied by this factor after --warmup_epochs')
     parser.add_argument('--warmup_epochs', type=int, default=0,
                         help='Gradually warm-up(increasing) learning rate in optimizer')
-    ###########################
-    #### params for steplr ####
+
+    ######################################
+    # params for learning rate scheduler #
+    ######################################
     parser.add_argument('--decay_step', nargs='+', type=int, default=[20],
                         help='scheduler decay step')
     parser.add_argument('--decay_gamma', type=float, default=0.1,
                         help='learning rate decay amount')
-    ###########################
-    #### params for poly ####
     parser.add_argument('--poly_exp', type=float, default=0.9,
                         help='exponent for polynomial learning rate decay')
-    ###########################
-
+    
+    #########################################
+    # params for current experiment setting #
+    #########################################
     parser.add_argument('--exp_name', type=str, default='exp',
                         help='experiment name')
     

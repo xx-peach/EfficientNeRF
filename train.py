@@ -39,81 +39,112 @@ logging.getLogger("lightning").setLevel(logging.ERROR)
 
 class NerfTree_Pytorch(object):  # This is only based on Pytorch implementation
     def __init__(self, xyz_min, xyz_max, grid_coarse, grid_fine, deg, sigma_init, sigma_default, device):
-        '''
-        xyz_min: list (3,) or (1, 3)
-        scope: float
+        ''' this is only based on Pytorch implementation
+        arguments:
+            xyz_min       - list (3,) or (1, 3), default = [-coord_scope, -coord_scope, -coord_scope] <- [-3.0, -3.0, -3.0]
+            xyz_max       - list (3,) or (1, 3), default = [ coord_scope,  coord_scope,  coord_scope] <- [ 3.0,  3.0,  3.0]
+            grid_coarse   - int, the grid resolution of coarse density Voxels Vc, default = 384
+            grid_fine     - int, the additional grid resolution of fine density Voxels Vf inside each coarse density voxel, default = 3
+            deg           - 
+            sigma_init    - float, the initial volume density of all voxels inside the coarse density Voxels Vc, default = 30.0
+            sigma_default - float, the initial volume density of all voxels inside the fine density Voxels Vf, default = -20.0 
         '''
         super().__init__()
-        self.sigma_init = sigma_init
-        self.sigma_default = sigma_default
+        self.sigma_init = sigma_init        # initial volume density for coarse density voxels, default = 30.0
+        self.sigma_default = sigma_default  # initial volume density for fine density voxels, default = -20.0
 
-        self.sigma_voxels_coarse = torch.full((grid_coarse,grid_coarse,grid_coarse), self.sigma_init, device=device)
-        self.index_voxels_coarse = torch.full((grid_coarse,grid_coarse,grid_coarse), 0, dtype=torch.long, device=device)
+        # (Dc, Dc, Dc) == (384, 384, 384) of (1,), the coarse density Voxels Vc which stores only the lateset density inside
+        self.sigma_voxels_coarse = torch.full((grid_coarse,grid_coarse,grid_coarse), self.sigma_init, device=device)        # (Dc, Dc, Dc)
+        self.index_voxels_coarse = torch.full((grid_coarse,grid_coarse,grid_coarse), 0, dtype=torch.long, device=device)    # (Dc, Dc, Dc)
         self.voxels_fine = None
 
-        self.xyz_min = xyz_min[0]
-        self.xyz_max = xyz_max[0]
-        self.xyz_scope = self.xyz_max - self.xyz_min
-        self.grid_coarse = grid_coarse
-        self.grid_fine = grid_fine
-        self.res_coarse = grid_coarse
-        self.res_fine = grid_coarse * grid_fine        
+        self.xyz_min = xyz_min[0]                           # default = -3.0
+        self.xyz_max = xyz_max[0]                           # default =  3.0
+        self.xyz_scope = self.xyz_max - self.xyz_min        # default =  6.0
+
+        self.grid_coarse = grid_coarse              # default = 384
+        self.grid_fine = grid_fine                  # default = 3
+        self.res_coarse = grid_coarse               # 384, 即对于 coarse density Voxels Vc 来说，它把整个 [xyz_min, xyz_max] 场景分成了 [384, 384, 384] 份
+        self.res_fine = grid_coarse * grid_fine     # 1152，而 fine density Voxels Vf 来说，它是将 coarse density Voxels Vc 的每个 voxel 又分成了 [3, 3, 3] 份
+        
         self.dim_sh = 3 * (deg + 1)**2
         self.device = device
     
     def calc_index_coarse(self, xyz):
+        """ compute the coarse grid coordinate of each sampled point in world coordinate
+        arguments:
+            xyz - (N, 3), world coordinates of all the sampled points
+        returns:
+            ijk_coarse - (N, 3), grid coarse coordinates of all the sampled points
+        """
         ijk_coarse = ((xyz - self.xyz_min) / self.xyz_scope * self.grid_coarse).long().clamp(min=0, max=self.grid_coarse-1)
         # return index_coarse[:, 0] * (self.grid_coarse**2) + index_coarse[:, 1] * self.grid_coarse + index_coarse[:, 2]
         return ijk_coarse
 
     def update_coarse(self, xyz, sigma, beta):
+        ''' update the stored volume density inside the coarse density Voxels Vc using the valid density just predicted by coarse MLP
+        arguments:
+            xyz   - (Nv, 3), world coordinates of all the sampled points
+            sigma - (Nv,), densities that just predicted by the coarse MLP of all the sampled points
+        returns:
+            self.sigma_voxels_coarse - lateset updated coarse density Voxels Vc
         '''
-            xyz: (N, 3)
-            sigma: (N,)
-        '''
+        # compute the coarse grid coordinate of each sampled point
         ijk_coarse = self.calc_index_coarse(xyz)
-
+        # update the coarse density Voxels Vc using beta momumtum mathod
         self.sigma_voxels_coarse[ijk_coarse[:, 0], ijk_coarse[:, 1], ijk_coarse[:, 2]] \
                     = (1 - beta) * self.sigma_voxels_coarse[ijk_coarse[:, 0], ijk_coarse[:, 1], ijk_coarse[:, 2]] + \
                         beta * sigma
     
     def create_voxels_fine(self):
-        ijk_coarse = torch.logical_and(self.sigma_voxels_coarse > 0, self.sigma_voxels_coarse != self.sigma_init).nonzero().squeeze(1)  # (N, 3)
-        num_valid = ijk_coarse.shape[0] + 1
+        """ create fine density Voxels Vf to those coarse voxels with its sigma(density) > 0 at each training step
+            每一个 training iteration 开始时都会调用该函数，根据 latest coarse Voxels Vc 来初始化一个新的 fine density Voxels Vf
+        """
+        # https://pytorch.org/docs/stable/generated/torch.logical_and.html
+        # (Nv, 3), indices of Nv valid sample points, namely indices of those coarse voxels with sigma > 0
+        ijk_coarse = torch.logical_and(self.sigma_voxels_coarse > 0, self.sigma_voxels_coarse != self.sigma_init).nonzero().squeeze(1)  # (Nv, 3)
 
-        index = torch.arange(1, num_valid, dtype=torch.long, device=ijk_coarse.device)
-        self.index_voxels_coarse[ijk_coarse[:, 0], ijk_coarse[:, 1], ijk_coarse[:, 2]] = index
+        # indexing the valid sample points from 1 to Nv
+        num_valid = ijk_coarse.shape[0] + 1                                                     # Nv + 1
+        index = torch.arange(1, num_valid, dtype=torch.long, device=ijk_coarse.device)          # (Nv,), namely tensor([1, 2, ..., Nv])
+        self.index_voxels_coarse[ijk_coarse[:, 0], ijk_coarse[:, 1], ijk_coarse[:, 2]] = index  # (Dc, Dc, Dc)
 
-        self.voxels_fine = torch.zeros(num_valid, self.grid_fine, self.grid_fine, self.grid_fine, self.dim_sh+1, device=self.device)
-        self.voxels_fine[...,  0] = self.sigma_default
-        self.voxels_fine[..., 1:] = 0.0
+        # (Nv, Df, Df, Df) of (28,), the fine density Voxels Vf which stores the volume density, rgb color and so on
+        self.voxels_fine = torch.zeros(num_valid, self.grid_fine, self.grid_fine, self.grid_fine, self.dim_sh+1, device=self.device)    # (Nv, Dc, Dc, Dc, 28)
+        self.voxels_fine[...,  0] = self.sigma_default      # first dimension stores the volume density, initilize by sigma_default
+        self.voxels_fine[..., 1:] = 0.0                     # remaining dimensions store the color rgb and so on
 
     def calc_index_fine(self, xyz):
-        # xyz_norm = (xyz - self.xyz_min) / self.xyz_scope
-        # xyz_coarse =  (xyz_norm * self.grid_coarse).long() * self.grid_fine
-        # xyz_fine = (xyz_norm * self.res_fine).long()
-        # index_fine = ((xyz_fine - xyz_coarse)).clamp(0, self.grid_fine-1)
-
-        xyz_norm = (xyz - self.xyz_min) / self.xyz_scope
-        xyz_fine = (xyz_norm * self.res_fine).long()
-        index_fine = xyz_fine % self.grid_fine
+        """ compute the fine grid coordinate(已知 coarse index 的情况下求 coarse voxel 内的 fine index) of each sampled point
+        arguments:
+            xyz - (N, 3), world coordinates of all the sampled points
+        returns:
+            index_fine - (N, 3), grid fine coordinates of all the sampled points inside the coarse voxels
+        """
+        xyz_norm = (xyz - self.xyz_min) / self.xyz_scope    # (N, 3)
+        xyz_fine = (xyz_norm * self.res_fine).long()        # (N, 3)
+        index_fine = xyz_fine % self.grid_fine              # (N, 3)
         return index_fine
         
     def update_fine(self, xyz, sigma, sh):
+        ''' update the fine density Voxels Vf by simply assignment
+        arguments:
+            xyz   - (N, 3), world coordinates of all the sampled points
+            sigma - (N, 1), densities that just predicted by the fine MLP of all the sampled points
+            sh    - (N, F), 
+        returns:
+            self.voxels_fine - lateset updated fine density Voxels Vf
         '''
-            xyz: (N, 3)
-            sigma: (N, 1)
-            sh: (N, F)
-        '''
-        # calc ijk_coarse
-        index_coarse = self.query_coarse(xyz, 'index')
-        nonzero_index_coarse = torch.nonzero(index_coarse).squeeze(1)
+        # calculate `ijk_coarse` and use it to get the valid flag of Vc voxels corresponding to xyz
+        index_coarse = self.query_coarse(xyz, 'index')                  # (N,) each belongs to the range(0, 1, ..., Nv)
+        # 
+        nonzero_index_coarse = torch.nonzero(index_coarse).squeeze(1)   # (Nv,), index of valid sampled point in xyz, xyz[i] valid if Vc[i]'s index_voxels_coarse > 0
         index_coarse = index_coarse[nonzero_index_coarse]
 
-        # calc index_fine
+        # calculate `index_fine` of each valid sample points
         ijk_fine = self.calc_index_fine(xyz[nonzero_index_coarse])
 
-        # feat
+        # concatenate the fine MLP predicted sigma and sh together
         feat = torch.cat([sigma, sh], dim=-1)
 
         self.voxels_fine[index_coarse, ijk_fine[:, 0], ijk_fine[:, 1], ijk_fine[:, 2]] = feat[nonzero_index_coarse]
@@ -125,9 +156,9 @@ class NerfTree_Pytorch(object):  # This is only based on Pytorch implementation
         ijk_coarse = self.calc_index_coarse(xyz)
 
         if type == 'sigma':
-            out = self.sigma_voxels_coarse[ijk_coarse[:, 0], ijk_coarse[:, 1], ijk_coarse[:, 2]]
+            out = self.sigma_voxels_coarse[ijk_coarse[:, 0], ijk_coarse[:, 1], ijk_coarse[:, 2]]    # (N,)
         else:
-            out = self.index_voxels_coarse[ijk_coarse[:, 0], ijk_coarse[:, 1], ijk_coarse[:, 2]]
+            out = self.index_voxels_coarse[ijk_coarse[:, 0], ijk_coarse[:, 1], ijk_coarse[:, 2]]    # (N,)
         return out
 
     def query_fine(self, xyz):
@@ -148,28 +179,27 @@ class EfficientNeRFSystem(LightningModule):
         super(EfficientNeRFSystem, self).__init__()
         self.save_hyperparameters(hparams)
 
+        # instantiate the loss function
         self.loss = loss_dict[hparams.loss_type]()
 
-        self.embedding_xyz = Embedding(3, 10) # 10 is the default number
-        self.embedding_dir = Embedding(3, 4) # 4 is the default number
+        # instantiate the positional embedder for xyz and view directions
+        self.embedding_xyz = Embedding(3, 10)       # 10 is the default number
+        self.embedding_dir = Embedding(3, 4)        # 4 is the default number
         self.embeddings = [self.embedding_xyz, self.embedding_dir]
 
         self.deg = 2
         self.dim_sh = 3 * (self.deg + 1)**2
 
-        self.nerf_coarse = NeRF(D=4, W=128,
-                                in_channels_xyz=63, in_channels_dir=27, 
-                                skips=[2], deg=self.deg)
+        # instantiate the coarse NeRF model and the fine NeRF model
+        self.nerf_coarse = NeRF(D=4, W=128, in_channels_xyz=63, in_channels_dir=27, skips=[2], deg=self.deg)
         self.models = [self.nerf_coarse]
         if hparams.N_importance > 0:
-            self.nerf_fine = NeRF(D=8, W=256,
-                                in_channels_xyz=63, in_channels_dir=27, 
-                                skips=[4], deg=self.deg)
+            self.nerf_fine = NeRF(D=8, W=256, in_channels_xyz=63, in_channels_dir=27, skips=[4], deg=self.deg)
             self.models += [self.nerf_fine]
+
+        # instantiate the NeRFTree
         self.sigma_init = hparams.sigma_init
         self.sigma_default = hparams.sigma_default
-
-        # sparse voxels
         coord_scope = hparams.coord_scope
         self.nerf_tree = NerfTree_Pytorch(xyz_min=[-coord_scope, -coord_scope, -coord_scope], 
                                           xyz_max=[coord_scope, coord_scope, coord_scope], 
@@ -199,15 +229,21 @@ class EfficientNeRFSystem(LightningModule):
         return rays, rgbs
     
     def sigma2weights(self, deltas, sigmas):
-        # compute alpha by the formula (3)
-        # if self.training:
+        """ compute the weights from volume density using equation (2)
+        arguments:
+            deltas - (N_rays, N_samples_coarse), interval distance between every two coarse sampled points
+            sigmas - (N_rays, N_samples_coarse), last step updated volume density stored in the coarse density Voxels Vc of each coarse sampled point
+        returns:
+            weights - (N_rays, N_samples_coarse), compute the alpha_i*T_i of each coarse sampled point
+            alphas  - (N_rays, N_samples_coarse), compute the 1-exp(-sigma_i*delta_i) of each coarse sampled point
+        """
+        # add some noise to the volume density
         noise = torch.randn(sigmas.shape, device=sigmas.device)
         sigmas = sigmas + noise
-
-        # alphas = 1-torch.exp(-deltas*torch.nn.ReLU()(sigmas)) # (N_rays, N_samples_)
-        alphas = 1-torch.exp(-deltas*torch.nn.Softplus()(sigmas)) # (N_rays, N_samples_)
-        alphas_shifted = torch.cat([torch.ones_like(alphas[:, :1]), 1-alphas+1e-10], -1) # [1, a1, a2, ...]
-        weights = alphas * torch.cumprod(alphas_shifted, -1)[:, :-1] # (N_rays, N_samples_)
+        # use equation (2) to compute the weight using sigma(volume density)
+        alphas = 1-torch.exp(-deltas*torch.nn.Softplus()(sigmas))       # (N_rays, N_samples_coarse)
+        alphas_shifted = torch.cat([torch.ones_like(alphas[:, :1]), 1-alphas+1e-10], -1)    # [1, a1, a2, ...]
+        weights = alphas * torch.cumprod(alphas_shifted, -1)[:, :-1]    # (N_rays, N_samples_coarse)
         return weights, alphas
     
     def render_rays(self, 
@@ -264,101 +300,129 @@ class EfficientNeRFSystem(LightningModule):
                 rgb_final = rgb_final + 1-weights_sum.unsqueeze(-1)
 
             return rgb_final, depth_final, weights, sigmas, shs
-
-        # Extract models from lists
-        model_coarse = models[0]
-        embedding_xyz = embeddings[0]
-        device = rays.device
+        
+        #############################################################################
+        # extract models, positional embedder and other params from the input lists #
+        #############################################################################
+        model_coarse = models[0]                # coarse NeRF model
+        embedding_xyz = embeddings[0]           # positional embedder for xyz coordinate
+        device = rays.device                    # traget device: one of ['cpu', 'gpu']
         is_training = model_coarse.training
         result = {}
 
-        # Decompose the inputs
-        N_rays = rays.shape[0]
-        rays_o, rays_d = rays[:, 0:3], rays[:, 3:6] # both (N_rays, 3)
+        ############################################################################
+        # decompose the raw inputs returned by dataloader to get rays_o and rays_d #
+        ############################################################################
+        N_rays = rays.shape[0]                          # number of rays per batch, default = 1024
+        rays_o, rays_d = rays[:, 0:3], rays[:, 3:6]     # both of (N_rays, 3) == (batch_size, 3) == (1024, 3)
 
-        # Embed direction
+        #########################
+        # embed view directions #
+        #########################
         dir_embedded = None
-        
+
+        #############################################################################
+        # compute the coarse sample points coordinates using rays_o, rays_d, z_vals #
+        #############################################################################
         N_samples_coarse = self.N_samples_coarse
-        z_vals_coarse = self.z_vals_coarse.clone().expand(N_rays, -1)
+        z_vals_coarse = self.z_vals_coarse.clone().expand(N_rays, -1)   # (N_rays, N_samples_coarse)
+        # add some uniform perturb to the coarse sample points when training
         if is_training:
             delta_z_vals = torch.empty(N_rays, 1, device=device).uniform_(0.0, self.distance/N_samples_coarse)
-            z_vals_coarse = z_vals_coarse + delta_z_vals
-        
-        xyz_sampled_coarse = rays_o.unsqueeze(1) + \
-                             rays_d.unsqueeze(1) * z_vals_coarse.unsqueeze(2) # (N_rays, N_samples_coarse, 3)
+            z_vals_coarse = z_vals_coarse + delta_z_vals                # (N_rays, N_samples_coarse)
+        # compute the world coordinates of all the coarse sample points
+        xyz_sampled_coarse = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * z_vals_coarse.unsqueeze(2)         # (N_rays, N_samples_coarse, 3)
+        # reshape the `xyz_sampled_coarse` to 2 dimensions 
+        xyz_coarse = xyz_sampled_coarse.reshape(-1, 3)                  # (N_rays * N_samples_coarse, 3)
 
-        xyz_coarse = xyz_sampled_coarse.reshape(-1, 3)
-
-        # valid sampling
-        sigmas = self.nerf_tree.query_coarse(xyz_coarse, type='sigma').reshape(N_rays, N_samples_coarse)
-        
+        ##########################################################################
+        # perform valid sampling and compute the output of the coarse NeRF model #
+        #*only perform this during the training epoch_{0} and epoch_{num_epochs} #
+        ##########################################################################
+        sigmas = self.nerf_tree.query_coarse(xyz_coarse, type='sigma').reshape(N_rays, N_samples_coarse)    # (N_rays, N_samples_coarse)
         # update density voxel during coarse training
-        if is_training and self.nerf_tree.voxels_fine == None: 
+        if is_training and self.nerf_tree.voxels_fine == None:
+            #############################################################################
+            # compute the indices of all the valid coarse sample points we're gonna use #
+            #############################################################################
             with torch.no_grad():
-                # introduce uniform sampling, not necessary
+                # introduce uniform sampling, not necessary, 这是直接随机把部分 rays 所有的 sample points 都变成 valid
                 sigmas[torch.rand_like(sigmas[:, 0]) < self.hparams.uniform_ratio] = self.sigma_init 
-
+                # generate the indices of the valid sample points
                 if self.hparams.warmup_step > 0 and self.trainer.global_step <= self.hparams.warmup_step:
                     # during warmup, treat all points as valid samples
-                    idx_render_coarse = torch.nonzero(sigmas >= -1e10).detach()
+                    idx_render_coarse = torch.nonzero(sigmas >= -1e10).detach()     # (Nv, 2)
                 else:
                     # or else, treat points whose density > 0 as valid samples
-                    idx_render_coarse = torch.nonzero(sigmas > 0.0).detach()
-
+                    idx_render_coarse = torch.nonzero(sigmas > 0.0).detach()        # (Nv, 2)
+            #################################################
+            # compute the output of the coarse NeRF network #
+            #################################################
             rgb_coarse, depth_coarse, weights_coarse, sigmas_coarse, _ = \
-                inference(model_coarse, embedding_xyz, xyz_sampled_coarse, rays_d,
-                        dir_embedded, z_vals_coarse, idx_render_coarse)
-            result['rgb_coarse'] = rgb_coarse
-            result['z_vals_coarse'] = self.z_vals_coarse
-            result['depth_coarse'] = depth_coarse
-            result['sigma_coarse'] = sigmas_coarse
-            result['weight_coarse'] = weights_coarse
-            result['opacity_coarse'] = weights_coarse.sum(1)
-            result['num_samples_coarse'] = torch.FloatTensor([idx_render_coarse.shape[0] / N_rays])       
-            
-            # update 
-            xyz_coarse_ = xyz_sampled_coarse[idx_render_coarse[:, 0], idx_render_coarse[:, 1]]
-            sigmas_coarse_ = sigmas_coarse.detach()[idx_render_coarse[:, 0], idx_render_coarse[:, 1]]
+                inference(model_coarse, embedding_xyz, xyz_sampled_coarse, rays_d, dir_embedded, z_vals_coarse, idx_render_coarse)
+            # add coarse NeRF's result to the return dict()
+            result['num_samples_coarse'] = torch.FloatTensor([idx_render_coarse.shape[0] / N_rays])   
+            result['rgb_coarse']         = rgb_coarse
+            result['z_vals_coarse']      = self.z_vals_coarse
+            result['depth_coarse']       = depth_coarse
+            result['sigma_coarse']       = sigmas_coarse
+            result['weight_coarse']      = weights_coarse
+            result['opacity_coarse']     = weights_coarse.sum(1)
+            #################################################################################################    
+            # update the valid coarse density Voxels Vc using the density just predicted by the coarse NeRF #
+            #################################################################################################
+            xyz_coarse_ = xyz_sampled_coarse[idx_render_coarse[:, 0], idx_render_coarse[:, 1]]          # (Nv, 3)
+            sigmas_coarse_ = sigmas_coarse.detach()[idx_render_coarse[:, 0], idx_render_coarse[:, 1]]   # (Nv,)
             self.nerf_tree.update_coarse(xyz_coarse_, sigmas_coarse_, self.hparams.beta)
         
-        # deltas_coarse = self.deltas_coarse
+        ####################################################################################################
+        # re-compute the z value's distance between every two coarse sample points and compute the weights #
+        ####################################################################################################
         with torch.no_grad():
-            deltas_coarse = z_vals_coarse[:, 1:] - z_vals_coarse[:, :-1] # (N_rays, N_samples_-1)
-            delta_inf = 1e10 * torch.ones_like(deltas_coarse[:, :1]) # (N_rays, 1) the last delta is infinity
-            deltas_coarse = torch.cat([deltas_coarse, delta_inf], -1)  # (N_rays, N_samples_)
-            weights_coarse, _ = self.sigma2weights(deltas_coarse, sigmas)
+            # 一开始 prepare_data() 里面算的 deltas 其实没啥用，因为对于 training 来说是加了 perturb 的
+            deltas_coarse = z_vals_coarse[:, 1:] - z_vals_coarse[:, :-1]    # (N_rays, N_samples_coarse-1)
+            delta_inf = 1e10 * torch.ones_like(deltas_coarse[:, :1])        # (N_rays, 1) the last delta is infinity
+            deltas_coarse = torch.cat([deltas_coarse, delta_inf], -1)       # (N_rays, N_samples_coarse)
+            # 这里用的 sigmas 是从上一 step 的 coarse density Voxels Vc 的结果，而不是当前 step 更新过后的结果
+            weights_coarse, _ = self.sigma2weights(deltas_coarse, sigmas)   # (N_rays, N_samples_coarse) == (1024, 128)
             weights_coarse = weights_coarse.detach()
 
-        # pivotal sampling
-        idx_render = torch.nonzero(weights_coarse >= min(self.hparams.weight_threashold, weights_coarse.max().item()))
-        scale = N_importance
-        z_vals_fine = self.z_vals_fine.clone()
-        if is_training:
-            z_vals_fine = z_vals_fine + delta_z_vals
-
-        idx_render = idx_render.unsqueeze(1).expand(-1, scale, -1)  # (B, scale, 2)
-        idx_render_fine = idx_render.clone()
+        ###############################################################################################
+        # find pivotal sample points(indice) with weight > epsilon among all the coarse sample points #
+        ###############################################################################################
+        idx_render = torch.nonzero(weights_coarse >= min(self.hparams.weight_threashold, weights_coarse.max().item()))  # (Np, 2), Np \in [0, N_rays * N_samples_coarse]
+        scale = N_importance        # default = 128, sample N_importance fine points near each pivotal points
+        #########################################################################################
+        # compute the specific indices of fine sample points near all the pivotal sample points #
+        #########################################################################################
+        z_vals_fine = self.z_vals_fine.clone()                          # (1, N_samples_coarse * N_importance) == (1, 128*5)
+        # z_vals_fine 是 prepare_data() 的时候就预先准备好的，假设 each ray 上的所有 coarse sample points 都是 pivotal 后采样的 fine points 的 z values
+        if is_training: z_vals_fine = z_vals_fine + delta_z_vals        # (N_rays, N_samples_coarse * N_importance) == (1024, 128*5)
+        # find the valid pivotal fine sample points 
+        idx_render = idx_render.unsqueeze(1).expand(-1, scale, -1)      # (Np, N_importance, 2), Np ∈ [0, 1024*128]
+        # idx_render_fine[..., 0] represents the index of all the rays, idx_render_fine[..., 1] represents the index of all the coarse sample points along one ray
+        idx_render_fine = idx_render.clone()                            # (Np, N_importance, 2), Np ∈ [0, 1024*128]
+        # 编号是按照 coarse_{0} 的 [0, ..., scale-1], coarse_{1} 的 [scale, 2*scale-1], ..., 以及 coarse_{N_samples} 的 [(N_samples-1)*scale, N_samples*scale-1]
         idx_render_fine[..., 1] = idx_render[..., 1] * scale + (torch.arange(scale, device=device)).reshape(1, scale)
-        idx_render_fine = idx_render_fine.reshape(-1, 2)
-
+        idx_render_fine = idx_render_fine.reshape(-1, 2)                # (Np * N_importance, 2), Np*N_importance ∈ [0, 1024*128*5]
+        # sample maximum N_rays * 64 == 1024 * 64 points at the fine stage
         if idx_render_fine.shape[0] > N_rays * 64:
             indices = torch.randperm(idx_render_fine.shape[0])[:N_rays * 64]
             idx_render_fine = idx_render_fine[indices]
-        
-        xyz_sampled_fine = rays_o.unsqueeze(1) + \
-                            rays_d.unsqueeze(1) * z_vals_fine.unsqueeze(2) # (N_rays, N_samples*scale, 3)
-
-        # if self.nerf_tree.voxels_fine != None:
-        #     xyz_norm = (xyz_sampled_fine - self.xyz_min) / self.xyz_scope
-        #     xyz_norm = (xyz_norm * self.res_fine).long().float() / float(self.res_fine)
-        #     xyz_sampled_fine = xyz_norm * self.xyz_scope + self.xyz_min
-
+        ###############################################################
+        # compute the world coordinates of all the fine sample points #
+        ###############################################################
+        xyz_sampled_fine = rays_o.unsqueeze(1) + rays_d.unsqueeze(1) * z_vals_fine.unsqueeze(2)     # (N_rays, N_samples*N_importance, 3)
+        #############################################
+        # compute the output of the fine NeRF model #
+        #############################################
         model_fine = models[1]
         rgb_fine, depth_fine, _, sigmas_fine, shs_fine = \
-            inference(model_fine, embedding_xyz, xyz_sampled_fine, rays_d,
-                    dir_embedded, z_vals_fine, idx_render_fine)
-        
+            inference(model_fine, embedding_xyz, xyz_sampled_fine, rays_d, dir_embedded, z_vals_fine, idx_render_fine)
+        #############################################################################################    
+        # update the valid fine density Voxels Vf using the results just predicted by the fine NeRF #
+        #*only perform this update during the last epoch, namely epoch_{num_epoch} for caching use. #
+        #############################################################################################
         if is_training and self.nerf_tree.voxels_fine != None:
             with torch.no_grad():
                 xyz_fine_ = xyz_sampled_fine[idx_render_fine[:, 0], idx_render_fine[:, 1]]
@@ -366,6 +430,7 @@ class EfficientNeRFSystem(LightningModule):
                 shs_fine_ = shs_fine.detach()[idx_render_fine[:, 0], idx_render_fine[:, 1]]
                 self.nerf_tree.update_fine(xyz_fine_, sigmas_fine_, shs_fine_)
 
+        # add fine NeRF's result to the return dict()
         result['rgb_fine'] = rgb_fine
         result['depth_fine'] = depth_fine
         result['num_samples_fine'] = torch.FloatTensor([idx_render_fine.shape[0] / N_rays])
@@ -417,47 +482,72 @@ class EfficientNeRFSystem(LightningModule):
         optimizer.zero_grad()
 
     def prepare_data(self):
-        dataset = dataset_dict[self.hparams.dataset_name]
-        kwargs = {'root_dir': self.hparams.root_dir,
-                  'img_wh': tuple(self.hparams.img_wh)}
+        """ https://pytorch-lightning.readthedocs.io/en/stable/common/lightning_module.html?highlight=prepare_data#prepare-data
+            called right after the __init__() function? in my comprehension
+        """
+        ####################################################################
+        # create the specifiy training dataset and validation/test dataset #
+        ####################################################################
+        dataset = dataset_dict[self.hparams.dataset_name]   # default = BlenderDataset
+        # prepare kwargs for instantiating the dataset object
+        kwargs = {'root_dir': self.hparams.root_dir, 'img_wh': tuple(self.hparams.img_wh)}
+        # create the training dataset
         self.train_dataset = dataset(split='train', **kwargs)
-        if self.hparams.dataset_name == 'blender':
-            self.val_dataset = dataset(split='test', **kwargs)
-        else:
-            self.val_dataset = dataset(split='val', **kwargs)
+        # create the validation or test(for blender type) dataset
+        if self.hparams.dataset_name == 'blender': self.val_dataset = dataset(split='test', **kwargs)
+        else: self.val_dataset = dataset(split='val', **kwargs)
         
-        self.near = self.train_dataset.near
-        self.far = self.train_dataset.far
-        self.distance = self.far - self.near
-        near = torch.full((1,), self.near, dtype=torch.float32, device='cuda')
-        far = torch.full((1,), self.far, dtype=torch.float32, device='cuda')
+        ###########################################################################
+        # fetch the common bounds for all scenes in blender(or other data types?) #
+        ###########################################################################
+        self.near = self.train_dataset.near                 # default = 2.0
+        self.far = self.train_dataset.far                   # default = 6.0
+        self.distance = self.far - self.near                # default = 4.0
+        # transfer the float bounds to torch.Tensor()
+        near = torch.full((1,), self.near, dtype=torch.float32, device='cuda')      # (1,), namely tensor([2.0,])
+        far = torch.full((1,), self.far, dtype=torch.float32, device='cuda')        # (1,), namely tensor([6.0,])
 
-        # z_vals_coarse
-        self.N_samples_coarse = self.hparams.N_samples
-        z_vals_coarse = torch.linspace(0, 1, self.N_samples_coarse, device='cuda') # (N_samples_coarse)
-        if not self.hparams.use_disp: # use linear sampling in depth space
-            z_vals_coarse = near * (1-z_vals_coarse) + far * z_vals_coarse
-        else: # use linear sampling in disparity space
-            z_vals_coarse = 1/(1/near * (1-z_vals_coarse) + 1/far * z_vals_coarse)   # (N_rays, N_samples_coarse)
-        self.z_vals_coarse = z_vals_coarse.unsqueeze(0)
+        ###############################################################################
+        # generate the z values of all the linear coarse sample points along each ray #
+        ###############################################################################
+        self.N_samples_coarse = self.hparams.N_samples                              # default = 128
+        # compute z values of all the coarse sample points linearly
+        z_vals_coarse = torch.linspace(0, 1, self.N_samples_coarse, device='cuda')  # (N_samples_coarse,)
+        if not self.hparams.use_disp:
+            # use linear sampling in depth space
+            z_vals_coarse = near * (1-z_vals_coarse) + far * z_vals_coarse          # (N_samples_coarse,)
+        else:
+            # use linear sampling in disparity space
+            z_vals_coarse = 1/(1/near * (1-z_vals_coarse) + 1/far * z_vals_coarse)  # (N_samples_coarse,)
+        # add first dimension to the `z_vals_coarse`
+        self.z_vals_coarse = z_vals_coarse.unsqueeze(0)     # (1, N_samples_coarse)
 
-        # z_vals_fine
-        self.N_samples_fine = self.hparams.N_samples * self.hparams.N_importance
-        z_vals_fine = torch.linspace(0, 1, self.N_samples_fine, device='cuda') # (N_samples_coarse)
-        if not self.hparams.use_disp: # use linear sampling in depth space
-            z_vals_fine = near * (1-z_vals_fine) + far * z_vals_fine
-        else: # use linear sampling in disparity space
-            z_vals_fine = 1/(1/near * (1-z_vals_fine) + 1/far * z_vals_fine)   # (N_rays, N_samples_coarse)
-        self.z_vals_fine = z_vals_fine.unsqueeze(0)
+        #############################################################################
+        # generate the z values of all the linear fine sample points along each ray #
+        #############################################################################
+        self.N_samples_fine = self.hparams.N_samples * self.hparams.N_importance    # default = 128 * 5 = 640
+        # compute z values of all the fine sample points linearly
+        z_vals_fine = torch.linspace(0, 1, self.N_samples_fine, device='cuda')      # (N_samples_coarse,)
+        if not self.hparams.use_disp:
+            # use linear sampling in depth space
+            z_vals_fine = near * (1-z_vals_fine) + far * z_vals_fine                # (N_samples_coarse,)
+        else:
+            # use linear sampling in disparity space
+            z_vals_fine = 1/(1/near * (1-z_vals_fine) + 1/far * z_vals_fine)        # (N_samples_coarse,)
+        # add first dimension to the `z_vals_coarse`
+        self.z_vals_fine = z_vals_fine.unsqueeze(0)         # (1, N_samples_coarse)
 
-        # delta
-        deltas = self.z_vals_coarse[:, 1:] - self.z_vals_coarse[:, :-1] # (N_rays, N_samples_-1)
-        delta_inf = 1e10 * torch.ones_like(deltas[:, :1]) # (N_rays, 1) the last delta is infinity
-        self.deltas_coarse = torch.cat([deltas, delta_inf], -1)  # (N_rays, N_samples_)
-
-        deltas = self.z_vals_fine[:, 1:] - self.z_vals_fine[:, :-1] # (N_rays, N_samples_-1)
-        delta_inf = 1e10 * torch.ones_like(deltas[:, :1]) # (N_rays, 1) the last delta is infinity
-        self.deltas_fine = torch.cat([deltas, delta_inf], -1)  # (N_rays, N_samples_)
+        ################################################################################################
+        # compute the z value's distance between every two sample points, coarse and fine respectively #
+        ################################################################################################
+        # distance for coarse sample points
+        deltas = self.z_vals_coarse[:, 1:] - self.z_vals_coarse[:, :-1]     # (1, N_samples_coarse-1)
+        delta_inf = 1e10 * torch.ones_like(deltas[:, :1])                   # (1, 1) the last delta is infinity
+        self.deltas_coarse = torch.cat([deltas, delta_inf], -1)             # (1, N_samples_coarse)
+        # distance for fine sample points
+        deltas = self.z_vals_fine[:, 1:] - self.z_vals_fine[:, :-1]     # (1, N_samples_fine-1)
+        delta_inf = 1e10 * torch.ones_like(deltas[:, :1])               # (1, 1) the last delta is infinity
+        self.deltas_fine = torch.cat([deltas, delta_inf], -1)           # (1, N_samples_fine)
         
 
     def configure_optimizers(self):
@@ -470,21 +560,22 @@ class EfficientNeRFSystem(LightningModule):
         return DataLoader(self.train_dataset,
                           shuffle=True,
                           num_workers=8,
-                          batch_size=self.hparams.batch_size,
+                          batch_size=self.hparams.batch_size,   # default = 1024
                           pin_memory=True)
 
     def val_dataloader(self):
         return DataLoader(self.val_dataset,
                           shuffle=False,
                           num_workers=4,
-                          batch_size=1, # validate one image (H*W rays) at a time
+                          batch_size=1,                         # validate one image (H*W rays) at a time
                           pin_memory=True)
     
     def training_step(self, batch, batch_idx):
         self.log('train/lr', get_learning_rate(self.optimizer), on_step=True, prog_bar=True)
         rays, rgbs = self.decode_batch(batch)
-        extract_time = self.current_epoch >= (self.hparams.num_epochs - 1)
 
+        # create the fine density Voxels Vf only at the last epoch_{num_epoch}
+        extract_time = self.current_epoch >= (self.hparams.num_epochs - 1)
         if extract_time and self.nerf_tree.voxels_fine == None:
             self.nerf_tree.create_voxels_fine()
     
@@ -609,8 +700,7 @@ class EfficientNeRFSystem(LightningModule):
 if __name__ == '__main__':
     hparams = get_opts()
     system = EfficientNeRFSystem(hparams)
-    checkpoint_callback = ModelCheckpoint(dirpath=os.path.join(f'logs/{hparams.exp_name}/ckpts',
-                                                                '{epoch:d}'),
+    checkpoint_callback = ModelCheckpoint(dirpath=os.path.join(f'logs/{hparams.exp_name}/ckpts', '{epoch:d}'),
                                           monitor='val/psnr',
                                           mode='max',
                                           save_top_k=5,)
